@@ -1,3 +1,4 @@
+require 'tiny_ds'
 module TinyDS
   class Base
     # convert calls from Rails generated scaffold
