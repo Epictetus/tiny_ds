@@ -4,7 +4,7 @@ module TinyDS
 class Base
   class << self; attr_accessor :_property_definitions; end
   RESERVED_PROPERTY_NAME = [:id, :name, :key, :entity, :parent_key, :parent]
-  VALID_PROPERTY_TYPE = [:string, :integer, :float, :text, :time, :list]
+  VALID_PROPERTY_TYPE = [:string, :integer, :float, :boolean, :text, :time, :list]
   def self.property(pname, ptype, opts={})
     pname = pname.to_sym
     if RESERVED_PROPERTY_NAME.include?(pname)
@@ -19,6 +19,21 @@ class Base
 
   def self.property_definition(name)
     property_definitions[name.to_sym] or raise "unknown property='#{name}'"
+  end
+
+  def self.valid_property?(name, context) # context => :filter,:sort
+    name = name.to_sym
+    if name==:__key__
+      true
+    elsif property_definitions[name.to_sym]
+      true
+    else
+      false
+    end
+  end
+
+  def self.has_property?(name)
+    property_definitions.has_key?(name.to_sym)
   end
 
   def self.default_attrs
@@ -147,17 +162,19 @@ class Base
 #  end
 
   def __before_save_set_timestamps
-    if self.class.property_definitions[:created_at] && new_record?
+    if self.class.has_property?(:created_at) && new_record?
       self.created_at = Time.now
     end
-    if self.class.property_definitions[:updated_at]
+    if self.class.has_property?(:updated_at)
       self.updated_at = Time.now
     end
   end
 
   # Foo.get(key)
   def self.get!(key)
-    self.new_from_entity(LowDS.get(key, :kind=>self.kind))
+    ent = LowDS.get(key)
+    raise "kind missmatch. #{ent.kind}!=#{self.kind}" if ent.kind != self.kind
+    self.new_from_entity(ent)
   end
   def self.get(key)
     get!(key)
@@ -165,15 +182,18 @@ class Base
     nil
   end
 
+  def self.build_key(id_or_name, parent)
+    if parent
+      parent = to_key(parent)
+      kfb = LowDS::KeyFactory::Builder.new(parent)
+      kfb.addChild(kind, id_or_name)
+      kfb.key
+    else
+      LowDS::KeyFactory::Builder.new(kind, id_or_name).key
+    end
+  end
   def self._get_by_id_or_name!(id_or_name, parent)
-    key = if parent
-            parent = to_key(parent)
-            kfb = LowDS::KeyFactory::Builder.new(parent)
-            kfb.addChild(kind, id_or_name)
-            kfb.key
-          else
-            LowDS::KeyFactory::Builder.new(kind, id_or_name).key
-          end
+    key = build_key(id_or_name, parent)
     get!(key)
   end
 
@@ -189,17 +209,32 @@ class Base
     _get_by_id_or_name!(name, parent)
   end
   def self.get_by_id(id, parent=nil)
-    if id.kind_of?(String) && id==id.to_i.to_s
-      id = id.to_i
-    end
-    _get_by_id_or_name!(id, parent)
+    get_by_id!(id, parent)
   rescue AppEngine::Datastore::EntityNotFound => e
     nil
   end
   def self.get_by_name(name, parent=nil)
-    _get_by_id_or_name!(name, parent)
+    get_by_name!(name, parent)
   rescue AppEngine::Datastore::EntityNotFound => e
     nil
+  end
+
+  # batch get
+  def self.get_by_ids(ids, parent=nil)
+    keys = ids.collect{|id| build_key(id, parent) }
+    entities = LowDS.batch_get(keys)
+    objs = entities.collect do |ent|
+      if ent
+        raise "kind missmatch. #{ent.kind}!=#{self.kind}" if ent.kind != self.kind
+        self.new_from_entity(ent)
+      else
+        nil
+      end
+    end
+    objs
+  end
+  def self.get_by_names(names, parent=nil)
+    get_by_ids(names, parent)
   end
 
 #  # Foo.find
@@ -234,7 +269,11 @@ class Base
     AppEngine::Datastore.delete(keys)
   end
   def self.destroy_all
-    destroy(query.keys)
+    loop do
+      _keys = query.keys(:limit=>500)
+      break if _keys.empty?
+      destroy(_keys)
+    end
   end
 
   # set attributes
@@ -264,7 +303,16 @@ class Base
   # get property-value from @entity
   def get_property(k)
     prop_def = self.class.property_definition(k)
-    prop_def.to_ruby_value(@entity[k])
+    v = prop_def.to_ruby_value(@entity[k])
+    if v.nil?
+      if prop_def.has_default?
+        v = prop_def.default_value
+        unless v.nil?
+          set_property(k,v)
+        end
+      end
+    end
+    v
   end
 
   def method_missing(m, *args)

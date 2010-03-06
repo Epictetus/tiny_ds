@@ -1,161 +1,222 @@
 # memo デプロイ時に未完了のトランザクションがあってトランザクション定義がかわったら？version???
 module TinyDS
-class BaseTx
-  def src_phase(src, args)
-    raise "no impl."
-  end
-  def dest_phase(dest, args)
-    raise "no impl."
-  end
-  def self.tx_kind
-    name
-  end
-  def roll_forward_retries_limit
-    100
-  end
-  def tx_retries
-    3
-  end
-  attr_reader :tx_key
+  class BaseTx
+    class SrcJournal < ::TinyDS::Base
+      property :dest_class,         :string, :index=>false
+      property :dest_key,           :string, :index=>false
+      property :method_name,        :string, :index=>false
+      property :args_yaml,          :text
+      property :status,             :string # created => copied
+      property :copy_failed_count,  :integer, :default=>0
+      property :updated_at,         :time
+      property :created_at,         :time
 
-  # トランザクション実行
-  #          :  src_phase   dest_phase
-  #   raised :    failed      ----
-  #   false  :    OK          failed
-  #   true   :    OK          OK
-  def self.exec(src, dest, args={})
-    tx = new
-    tx.create_tx(src, dest, args)
-    begin
-      tx.roll_forward
-    rescue AppEngine::Datastore::TransactionFailed => e
-      return false
-    end
-    return true
-  end
+      def self.kind; "__SrcJournal" end
+      def key_string
+        self.key.to_s
+      end
 
-  def self.roll_forward_all(limit=50)
-    pending_tx_query.each(:limit=>limit) do |tx_src|
-      tx = new
-      tx.restore_tx(tx_src)
-      begin
-        tx.roll_forward
-      rescue => e
-        #p "roll_forward failed. tx=[#{tx.tx_key}] e=[#{e.inspect}]"
+      def self.create_journal(src, dest, method_name, *args)
+        # TODO raise if current_tx is none
+        if dest.kind_of?(TinyDS::Base)
+          dest = {:class=>dest.class.name, :key=>dest.key}
+        end
+        dest_class = dest
+        TinyDS.tx(:force_begin=>false) do
+          SrcJournal.create({
+                       :dest_class  => dest[:class],
+                       :dest_key    => dest[:key].to_s,
+                       :method_name => method_name.to_s,
+                       :args_yaml   => args.to_yaml,
+                       :status      => "created"
+                      }, :parent=>src)
+        end
+      end
+
+      # src_journalからdest_journalにコピーする
+      def copy_to_dest_journal
+        src_journal = self
+        dest_journal = nil
+
+        TinyDS.tx(:retries=>10, :force_begin=>true){ # EG-B
+          dest_journal = DestJournal.get_by_name(src_journal.key_string, src_journal.dest_key)
+          unless dest_journal
+            dest_journal = DestJournal.create({
+              :dest_class  => src_journal.dest_class,
+              :method_name => src_journal.method_name,
+              :args_yaml   => src_journal.args_yaml,
+              :status      => "copied"
+             },
+            { :parent => src_journal.dest_key,
+              :name   => src_journal.key_string
+             })
+          end
+        }
+
+        # (dest_journalができたら)src_journalをstatus="copied"に
+        src_journal.tx_update{|sj|
+          if sj.status=="created"
+            sj.status = "copied"
+          end
+        }
+
+        return dest_journal.key
+      rescue Object => e
+        increment_copy_failed_count
+        throw e
+      end
+
+      def increment_copy_failed_count
+        self.tx_update{|sj|
+          sj.copy_failed_count += 1
+        }
+      rescue AppEngine::Datastore::TransactionFailed => e
+        # ignore
       end
     end
-    nil
-  end
 
-  def self.pending_tx_query(status="pending", dire=:asc) # pending/done/failed
-    TxSrc.query.
-      filter(:tx_kind, "==", tx_kind).
-      filter(:status,  "==", status).
-      sort(:created_at, dire)
-  end
+    class DestJournal < ::TinyDS::Base
+      property :dest_class,         :string, :index=>false
+      property :method_name,        :string, :index=>false
+      property :args_yaml,          :text
+      property :status,             :string # copied => done
+      property :apply_failed_count, :integer, :default=>0
+      property :updated_at,         :time
+      property :created_at,         :time
 
-  # doneなTxSrcと対応するTxDoneを削除する
-#  def self.delete_done_tx
-#  end
+      def self.kind; "__DestJournal" end
 
-  class TxSrc < Base
-    property :tx_kind,                   :string
-    property :dest_key,                  :string
-    property :status,                    :string,  :default=>"pending"
-    property :roll_forward_failed_count, :integer, :default=>0
-    property :args,                      :text
-    property :created_at,                :time
-    property :done_at,                   :time
-  end
-
-  # トランザクション前半
-  #   TODO TxIDを指定できるようにする。TxSrc#key.nameにTxIDを指定して重複実行防止
-  def create_tx(src, dest, args)
-    tx_src = nil
-    TinyDS.tx(tx_retries){
-      src = src.class.get(src.key)
-      src_phase(src, args)
-      src.save!
-
-      attrs = {
-        :tx_kind  => self.class.tx_kind,
-        :dest_key => dest.key.to_s,
-        :args     => args.to_yaml,
-      }
-      tx_src = TxSrc.create!(attrs, :parent=>src) # srcがparent, tx_srcがchild
-      # COMMIT:「srcの処理(=src_phase)、TxSrc作成」
-    }
-    @tx_key = tx_src.key
-    nil
-  end
-
-  def restore_tx(tx_src)
-    @tx_key = tx_src.key
-    nil
-  end
-
-  class TxDone < Base
-    property :done_at, :time
-  end
-
-  # トランザクション後半
-  def roll_forward
-    tx_src = TxSrc.get(@tx_key)
-
-    TinyDS.tx(tx_retries){
-      dest_key = LowDS::KeyFactory.stringToKey(tx_src.dest_key)
-      dest = dest_key.kind.constantize.get(dest_key)
-      done_name = "TxDone_#{@tx_key.to_s}"
-      done_key = LowDS::KeyFactory.createKey(dest.key, TxDone.kind, done_name)
-      begin
-        TxDone.get!(done_key)
-        # なにもしない : TxDoneが存在しているということはdest_phaseは処理済み
-      rescue AppEngine::Datastore::EntityNotFound => e
-        # TxDoneが無い→dest_phaseが未実行
-        attrs = {:done_at=>Time.now}
-        tx_done = TxDone.create!(attrs, :parent=>dest, :name=>done_name)
-        dest_phase(dest, YAML.load(tx_src.args)) # destの処理を実行
-        dest.save!
+      # destの'method_name'を実行し、dest_journalをstatus="done"にする
+      def self.apply_journal(dest_journal_key)
+        TinyDS.tx(:retries=>10, :force_begin=>true){ # EG-B
+          dest_journal = DestJournal.get(dest_journal_key)
+          return if dest_journal.status=="done"
+          klass = const_get(dest_journal.dest_class)
+          dest = klass.get(dest_journal.parent_key)
+          # TODO if dest.nil? ...
+          dest.send(dest_journal.method_name, *(YAML.load(dest_journal.args_yaml)))
+          dest_journal.status = "done"
+          dest_journal.save
+        }
+        nil
+      rescue Object => e
+        increment_apply_failed_count(dest_journal_key)
+        raise e
       end
-      # memo: done_keyが同じTxDoneをcommitしようとするとTransactionFailedになるはず→dest_phaseもキャンセル
-      # COMMIT:「destの処理(=dest_phase)、TxDone作成」
-    }
 
-    # TxSrc#statusをdoneに
-    TinyDS.tx(tx_retries){
-      tx_src = TxSrc.get!(@tx_key)
-      if tx_src.status=="pending"
-        tx_src.status = "done"
-        tx_src.done_at = Time.now
-        tx_src.save!
+      def self.increment_apply_failed_count(dest_journal_key)
+        TinyDS.tx(:force_begin=>true) do
+          dest_journal = DestJournal.get(dest_journal_key)
+          if dest_journal
+            dest_journal.apply_failed_count += 1
+            dest_journal.save
+          end
+        end
+      rescue AppEngine::Datastore::TransactionFailed => e
+        # ignore
       end
-    }
-    return true
-  rescue => e
-    puts e.inspect
-    TinyDS.tx(tx_retries){
-      tx_src = TxSrc.get!(@tx_key)
-      tx_src.roll_forward_failed_count += 1
-      if roll_forward_retries_limit < tx_src.roll_forward_failed_count
-        tx_src.status = "failed"
-      end
-      tx_src.save!
-    }
-    return false
-  end
-
-  if false
-    require "benchmark"
-    def create_tx(src, dest, args)
-      RAILS_DEFAULT_LOGGER.info ["create_tx", Benchmark.measure{
-        _create_tx(src, dest, args)
-      }].inspect
     end
-    def roll_forward
-      RAILS_DEFAULT_LOGGER.info ["roll_forward", Benchmark.measure{
-        _roll_forward
-      }].inspect
+
+    class << self
+      #=============================================================================================
+      # (STEP1) create_journal
+      # create src_journal as child of src.
+      # usage:
+      #   TinyDS.tx do # EG-A
+      #     entityA1 = Ent.get(...)
+      #     entityA1.save
+      #     TinyDS::BaseTx.create_journal(
+      #       src,  # entity of EG-A
+      #       dest, # entity of EG-B
+      #       :apply_some,
+      #       arg1, arg2, arg3, ...
+      #     )
+      #     # or entityA1.create_journal(dest, values)
+      #     # or entityA1.base_call(dest, method, arg1, arg2, ...)
+      #   end
+      def create_journal(src, dest, method_name, *args)
+        SrcJournal.create_journal(src, dest, method_name, *args)
+      end
+
+      #=============================================================================================
+      # (STEP2) copy_journal
+      # create dest_journal as child of dest.
+      # dest_journalができてsrc_journal.status=="copied"になるまで(cronなどで)繰り返し実行する
+      # usage:
+      #   dest_journal_key = src_journal.copy_to_dest_journal
+
+      #=============================================================================================
+      # (STEP3) apply_journal
+      #  dest_journal.status=="done" になるまで繰り返し実行する
+      #  destのメソッドでEG-Bのtx内で操作を行う
+      #  def apply_some(arg1,arg2,arg3,arg4,...)
+      #    self.aaa += arg1
+      #    self.bbb += arg2
+      #    self.ccc += arg3
+      #    self.save
+      #    entX = Ent.get(arg4)
+      #    entX.ddd += arg5
+      #    entX.save
+      #  end
+
+      # src_journalsをcopy/applyする
+      # usage:
+      #   until src_journals.empty?
+      #     src_journals = TinyDS::BaseTx.apply(src_journals)
+      #   end
+      def apply_without_retry(src_journals)
+        unless src_journals.kind_of?(Array)
+          src_journals = [src_journals]
+        end
+        failed_src_journals = []
+        src_journals.each do |sj|
+          begin
+            djk = sj.copy_to_dest_journal
+            DestJournal.apply_journal(djk)
+          rescue Object => e
+            failed_src_journals << sj
+          end
+        end
+        failed_src_journals
+      end
+      def apply(src_journals, opts={})
+        retries = opts[:retries] || 1
+        retries.times do
+          break if src_journals.empty?
+          src_journals = apply_without_retry(src_journals)
+        end
+        if opts[:raise] && !src_journals.empty?
+          raise "failed to apply #{src_journals.size} journal(s). #{src_journals.collect{|j| j.key }.inspect}"
+        end
+      end
+
+      def rollforward
+        rollforward_copy + rollforward_apply
+      end
+
+      # 実行されていないcopy_journalの実行
+      def rollforward_copy(opts={})
+        limit          = opts[:limit]          || 10
+        copy_retry_max = opts[:copy_retry_max] || 10
+        q = SrcJournal.query.filter(:status=>"created").
+                             filter(:copy_failed_count, "<", copy_retry_max)
+        q.sort(:copy_failed_count, :asc).each(:limit=>limit) do |src_journal|
+          src_journal.copy_to_dest_journal
+        end
+        q.count
+      end
+
+      # 実行されていないapply_journalの実行
+      def rollforward_apply(opts={})
+        limit           = opts[:limit]           || 10
+        apply_retry_max = opts[:apply_retry_max] || 10
+        q = DestJournal.query.filter(:status=>"copied").
+                              filter(:apply_failed_count, "<", apply_retry_max)
+        q.sort(:apply_failed_count, :asc).keys_only.each(:limit=>limit) do |dest_journal|
+          DestJournal.apply_journal(dest_journal.key)
+        end
+        q.count
+      end
     end
   end
-end
 end

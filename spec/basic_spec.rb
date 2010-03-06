@@ -37,6 +37,25 @@ describe TinyDS::Base do
   end
 
   describe "tx" do
+    it "should not begin new tx if current_transaction exists." do
+      TinyDS.tx{
+        tx1 = AppEngine::Datastore.current_transaction
+        TinyDS.tx{
+          tx2 = AppEngine::Datastore.current_transaction
+          tx1.getId.to_s.should == tx2.getId.to_s
+        }
+      }
+    end
+    it "should begin new tx if :force_begin=true." do
+      TinyDS.tx{
+        tx1 = AppEngine::Datastore.current_transaction
+        TinyDS.tx(:force_begin=>true){
+          tx2 = AppEngine::Datastore.current_transaction
+          # p [tx1.getId, tx2.getId]
+          tx1.getId.to_s.should_not == tx2.getId.to_s
+        }
+      }
+    end
     it "should retried if concurrent modify"
     it "should not overwrite properties modified by other tx"
     it "should not retry when application exception raised"
@@ -96,7 +115,7 @@ describe TinyDS::Base do
         c.body += " world"
         if loop_count<=5
           # modify entity by other tx
-          TinyDS.tx{ com = Comment.get(c0.key); com.num+=1; com.save; }
+          TinyDS.tx(:force_begin=>true){ com = Comment.get(c0.key); com.num+=1; com.save; }
         end
       }
       loop_count.should == 6
@@ -355,6 +374,25 @@ describe TinyDS::Base do
       proc{ Comment.get_by_name!(k1.name)         }.should raise_error(AppEngine::Datastore::EntityNotFound)
       proc{ Comment.get_by_name!(k1.name+"x", c0) }.should raise_error(AppEngine::Datastore::EntityNotFound)
     end
+    it "should be got by ids" do
+      k0 = Comment.create({}).key
+      k1 = Comment.create({}).key
+      k2 = Comment.create({}).key
+
+      a = Comment.get_by_ids([k0.id, k1.id, k2.id])
+      a.size.should == 3
+      a[0].key.to_s.should == k0.to_s
+      a[1].key.to_s.should == k1.to_s
+      a[2].key.to_s.should == k2.to_s
+
+      a[1].destroy
+      a = Comment.get_by_ids([k0.id, k1.id, k2.id])
+      a.size.should == 3
+      a[0].key.to_s.should == k0.to_s
+      a[1].should be_nil
+      a[2].key.to_s.should == k2.to_s
+    end
+    it "should be got by names"
   end
 
   describe "save" do
@@ -772,5 +810,154 @@ describe TinyDS::Base do
       User.query.filter(:favorites, ">=", 20).count.should == 6
       User.query.filter(:favorites, ">",  20).count.should == 4
     end
+    it "should be default is []" do
+      u1 = User.new
+      u1.favorites.should == []
+      u1.save
+      u1.favorites.should == []
+      u1 = User.get(u1.key)
+      u1.favorites.should == []
+    end
+    it "should be added" do
+      u1 = User.new
+      u1.favorites.size.should == 0
+      u1.favorites << "DOG"
+      u1.favorites.size.should == 0 #1
+      u1.favorites << "CAT"
+      u1.favorites.size.should == 0 #2
+
+      u1.favorites += ["DOG"]
+      u1.favorites.size.should == 1
+      u1.favorites += ["CAT"]
+      u1.favorites.size.should == 2
+      u1.save
+
+      u1 = User.get(u1.key)
+      u1.favorites.sort.should == ["CAT","DOG"]
+    end
+    it "should be removed" do
+      u1 = User.new
+      u1.favorites += ["CAT","DOG"]
+      u1.save
+
+      u1 = User.get(u1.key)
+      u1.favorites.sort.should == ["CAT","DOG"]
+      u1.favorites -= ["DOG"]
+      u1.favorites.sort.should == ["CAT"]
+      u1.save
+
+      u1 = User.get(u1.key)
+      u1.favorites.sort.should == ["CAT"]
+      u1.favorites -= ["CAT"]
+      u1.favorites.sort.should == []
+      u1.save
+
+      u1 = User.get(u1.key)
+      u1.favorites.sort.should == []
+    end
   end
+  describe "boolean property" do
+    class Book < TinyDS::Base
+      property :comic,   :boolean
+      property :picture, :boolean, :default=>nil
+      property :art,     :boolean, :default=>false
+      property :travel,  :boolean, :default=>true
+    end
+    it "with/without default" do
+      b = Book.new
+      b.comic.should   == nil
+      b.picture.should == nil
+      b.art.should     == false
+      b.travel.should  == true
+      b.save
+      b.comic.should   == nil
+      b.picture.should == nil
+      b.art.should     == false
+      b.travel.should  == true
+
+      b = Book.get(b.key)
+      b.comic.should   == nil
+      b.picture.should == nil
+      b.art.should     == false
+      b.travel.should  == true
+    end
+    it "set value" do
+      b = Book.new
+      b.comic   = true
+      b.picture = false
+      b.art     = nil
+      b.entity[:art].should == nil
+      b.entity.hasProperty(:art).should == false
+      b.travel  = false
+      #b.comic.should   == true
+      #b.picture.should == false
+      #b.art.should     == nil
+      #b.travel.should  == false
+      b.save
+      b.comic.should   == true
+      b.picture.should == false
+      b.art.should     == false # :default=>false
+      b.travel.should  == false
+
+      b = Book.get(b.key)
+      b.comic.should   == true
+      b.picture.should == false
+      b.art.should     == false # default=>false
+      b.travel.should  == false
+    end
+    it "set invalid value" do
+      proc{ Book.new(:comic=>1) }.should raise_error
+      proc{ Book.new(:comic=>"") }.should raise_error
+    end
+    it "query"
+  end
+
+  describe "default_value" do
+    class Parent
+    end
+    it "return default_value for nil or missing" do
+      c = Comment.new
+      c.flag.should == 5
+      c.flag = nil
+      c.save
+
+      c = Comment.get(c.key)
+      c.entity[:flag].should == nil
+      c.flag.should == 5
+      c.entity[:flag].should == 5
+    end
+    it "return default_value for added property" do
+      defined?(Food).should be_nil
+      class Parent::Food < TinyDS::Base
+        property :nickname, :string
+      end
+      defined?(Parent::Food).should == "constant"
+      f = Parent::Food.new(:nickname=>"tomato")
+      f.save
+
+      Parent.instance_eval{ remove_const(:Food) }
+      defined?(Parent::Food).should be_nil
+
+      class Parent::Food < TinyDS::Base
+        property :nickname, :string
+        property :color,    :string, :default=>"red"
+      end
+      f = Parent::Food.get(f.key)
+      f.entity[:color].should == nil
+      f.color.should == "red"
+      f.entity[:color].should == "red"
+      f.color = "green"
+      f.color.should == "green"
+      f.entity[:color].should == "green"
+      f.save
+
+      f = Parent::Food.get(f.key)
+      f.color.should == "green"
+      f.entity[:color].should == "green"
+    end
+  end
+
+  it "build_key"
+  it "timeout"
+  it "__key__ query"
 end

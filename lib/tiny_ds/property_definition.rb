@@ -32,6 +32,13 @@ class PropertyDefinition
       v.nil? ? nil : v.to_i
     when :float
       v.nil? ? nil : v.to_f
+    when :boolean
+      if v==false || v==true || v==nil
+        v
+      else
+        raise "not boolean value."
+      end
+      # ![nil, false].include?(v)
     when :text
       v.nil? ? nil : com.google.appengine.api.datastore::Text.new(v.to_s)
     when :time
@@ -64,6 +71,8 @@ class PropertyDefinition
       ds_v.nil? ? nil : ds_v.to_i
     when :float
       ds_v.nil? ? nil : ds_v.to_f
+    when :boolean
+      ds_v
     when :text
       ds_v.nil? ? nil : ds_v.to_s
     when :time
